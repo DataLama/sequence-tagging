@@ -136,3 +136,6 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+###########################3
+naver-nlp-challenge-2018/models/HanBert-54kN-torch
