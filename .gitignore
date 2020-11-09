@@ -140,3 +140,5 @@ cython_debug/
 ###########################
 naver-nlp-challenge-2018/models/HanBert-54kN-torch
 NoteBook/data
+train/zh-sentiment-tagging/data/*.json
+train/zh-sentiment-tagging/data/rs2f
