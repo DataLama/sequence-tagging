@@ -13,7 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" Named entity recognition fine-tuning: utilities to work with CoNLL-2003 task. """
+""" Token-classification fine-tuning utils.
+- Add prepadding options (for using data_collator)
+"""
 
 
 import logging
@@ -24,7 +26,7 @@ from enum import Enum
 from typing import List, Optional, Union
 
 from filelock import FileLock
-from transformers import PreTrainedTokenizer, is_torch_available
+from transformers import PreTrainedTokenizer, is_tf_available, is_torch_available
 
 
 logger = logging.getLogger(__name__)
@@ -57,7 +59,7 @@ class InputFeatures:
     input_ids: List[int]
     attention_mask: List[int]
     token_type_ids: Optional[List[int]] = None
-    label_ids: Optional[List[int]] = None
+    labels: Optional[List[int]] = None
 
 
 class Split(Enum):
@@ -203,7 +205,7 @@ class TokenClassificationTask:
 
             features.append(
                 InputFeatures(
-                    input_ids=input_ids, attention_mask=input_mask, token_type_ids=segment_ids, label_ids=label_ids
+                    input_ids=input_ids, attention_mask=input_mask, token_type_ids=segment_ids, labels=label_ids
                 )
             )
         return features
@@ -213,6 +215,9 @@ if is_torch_available():
     import torch
     from torch import nn
     from torch.utils.data.dataset import Dataset
+    
+    from transformers import BatchEncoding
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase, PaddingStrategy
 
     class TokenClassificationDataset(Dataset):
         """
@@ -279,3 +284,172 @@ if is_torch_available():
 
         def __getitem__(self, i) -> InputFeatures:
             return self.features[i]
+    
+    """2020.11.12
+    Custom the DataCollatorForTokenClassification, because of following problems.
+    (https://github.com/huggingface/transformers/blob/121c24efa4453e4e726b5f0b2cf7095b14b7e74e/src/transformers/data/data_collator.py#L119)
+    
+    - need to transform InputFeatures to dict
+    - cannot treat label name like label_ids
+    - label_name of batch is hard-coded
+    """
+    @dataclass
+    class DataCollatorForTokenClassification:
+        """
+        Data collator that will dynamically pad the inputs received, as well as the labels.
+        Args:
+            tokenizer (:class:`~transformers.PreTrainedTokenizer` or :class:`~transformers.PreTrainedTokenizerFast`):
+                The tokenizer used for encoding the data.
+            padding (:obj:`bool`, :obj:`str` or :class:`~transformers.tokenization_utils_base.PaddingStrategy`, `optional`, defaults to :obj:`True`):
+                Select a strategy to pad the returned sequences (according to the model's padding side and padding index)
+                among:
+                * :obj:`True` or :obj:`'longest'`: Pad to the longest sequence in the batch (or no padding if only a single
+                  sequence if provided).
+                * :obj:`'max_length'`: Pad to a maximum length specified with the argument :obj:`max_length` or to the
+                  maximum acceptable input length for the model if that argument is not provided.
+                * :obj:`False` or :obj:`'do_not_pad'` (default): No padding (i.e., can output a batch with sequences of
+                  different lengths).
+            max_length (:obj:`int`, `optional`):
+                Maximum length of the returned list and optionally padding length (see above).
+            pad_to_multiple_of (:obj:`int`, `optional`):
+                If set will pad the sequence to a multiple of the provided value.
+                This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
+                7.5 (Volta).
+            label_pad_token_id (:obj:`int`, `optional`, defaults to -100):
+                The id to use when padding the labels (-100 will be automatically ignore by PyTorch loss functions).
+        """
+
+        tokenizer: PreTrainedTokenizerBase
+        padding: Union[bool, str, PaddingStrategy] = True
+        max_length: Optional[int] = None
+        pad_to_multiple_of: Optional[int] = None
+        label_pad_token_id: int = -100
+
+        def __call__(self, features):
+            if not isinstance(features[0], (dict, BatchEncoding)): # InputFeatures -> Dict
+                features = [vars(f) for f in features]
+
+            label_name = [key if 'label' in key else 'labels' for key in features[0].keys()].pop() # treat label_name user way.
+            labels = [feature[label_name] for feature in features] if label_name in features[0].keys() else None
+
+            batch = self.tokenizer.pad(
+                features,
+                padding=self.padding,
+                max_length=self.max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                # Conversion to tensors will fail if we have labels as they are not of the same length yet.
+                return_tensors="pt" if labels is None else None,
+            )
+
+            if labels is None:
+                return batch
+
+            sequence_length = torch.tensor(batch["input_ids"]).shape[1]
+            padding_side = self.tokenizer.padding_side
+            if padding_side == "right":
+                batch[label_name] = [label + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels] #'labels' -> label_name
+            else:
+                batch[label_name] = [[self.label_pad_token_id] * (sequence_length - len(label)) + label for label in labels] #'labels' -> label_name
+
+            batch = {k: torch.tensor(v, dtype=torch.int64) for k, v in batch.items()}
+            return batch
+
+
+if is_tf_available():
+    import tensorflow as tf
+
+    class TFTokenClassificationDataset:
+        """
+        This will be superseded by a framework-agnostic approach
+        soon.
+        """
+
+        features: List[InputFeatures]
+        pad_token_label_id: int = -100
+        # Use cross entropy ignore_index as padding label id so that only
+        # real label ids contribute to the loss later.
+
+        def __init__(
+            self,
+            token_classification_task: TokenClassificationTask,
+            data_dir: str,
+            tokenizer: PreTrainedTokenizer,
+            labels: List[str],
+            model_type: str,
+            max_seq_length: Optional[int] = None,
+            overwrite_cache=False,
+            mode: Split = Split.train,
+        ):
+            examples = token_classification_task.read_examples_from_file(data_dir, mode)
+            # TODO clean up all this to leverage built-in features of tokenizers
+            self.features = token_classification_task.convert_examples_to_features(
+                examples,
+                labels,
+                max_seq_length,
+                tokenizer,
+                cls_token_at_end=bool(model_type in ["xlnet"]),
+                # xlnet has a cls token at the end
+                cls_token=tokenizer.cls_token,
+                cls_token_segment_id=2 if model_type in ["xlnet"] else 0,
+                sep_token=tokenizer.sep_token,
+                sep_token_extra=False,
+                # roberta uses an extra separator b/w pairs of sentences, cf. github.com/pytorch/fairseq/commit/1684e166e3da03f5b600dbb7855cb98ddfcd0805
+                pad_on_left=bool(tokenizer.padding_side == "left"),
+                pad_token=tokenizer.pad_token_id,
+                pad_token_segment_id=tokenizer.pad_token_type_id,
+                pad_token_label_id=self.pad_token_label_id,
+            )
+
+            def gen():
+                for ex in self.features:
+                    if ex.token_type_ids is None:
+                        yield (
+                            {"input_ids": ex.input_ids, "attention_mask": ex.attention_mask},
+                            ex.labels,
+                        )
+                    else:
+                        yield (
+                            {
+                                "input_ids": ex.input_ids,
+                                "attention_mask": ex.attention_mask,
+                                "token_type_ids": ex.token_type_ids,
+                            },
+                            ex.labels,
+                        )
+
+            if "token_type_ids" not in tokenizer.model_input_names:
+                self.dataset = tf.data.Dataset.from_generator(
+                    gen,
+                    ({"input_ids": tf.int32, "attention_mask": tf.int32}, tf.int64),
+                    (
+                        {"input_ids": tf.TensorShape([None]), "attention_mask": tf.TensorShape([None])},
+                        tf.TensorShape([None]),
+                    ),
+                )
+            else:
+                self.dataset = tf.data.Dataset.from_generator(
+                    gen,
+                    ({"input_ids": tf.int32, "attention_mask": tf.int32, "token_type_ids": tf.int32}, tf.int64),
+                    (
+                        {
+                            "input_ids": tf.TensorShape([None]),
+                            "attention_mask": tf.TensorShape([None]),
+                            "token_type_ids": tf.TensorShape([None]),
+                        },
+                        tf.TensorShape([None]),
+                    ),
+                )
+
+        def get_dataset(self):
+            self.dataset = self.dataset.apply(tf.data.experimental.assert_cardinality(len(self.features)))
+
+            return self.dataset
+
+        def __len__(self):
+            return len(self.features)
+
+        def __getitem__(self, i) -> InputFeatures:
+            return self.features[i]
+        
+        
+

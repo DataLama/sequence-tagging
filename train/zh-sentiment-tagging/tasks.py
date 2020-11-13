@@ -3,7 +3,7 @@ import os
 import json
 from typing import List, Union
 
-from .utils_ner import InputExample, Split, TokenClassificationTask
+from finetune import InputExample, Split, TokenClassificationTask
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ class SentimentTagging(TokenClassificationTask):
             examples.append(InputExample(guid=guid, words=words, labels=labels))
         return examples
     
-    def get_labels(self, path: str) -> List[str]:
+    def get_labels(self, path: str = None) -> List[str]:
         if path:
             with open(path) as f:
                 labels = f.read().splitlines()

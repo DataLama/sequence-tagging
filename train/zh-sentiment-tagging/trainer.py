@@ -1,269 +1,346 @@
-import argparse
-import glob
+import json
 import logging
 import os
-import collections
-from argparse import Namespace
-
+import sys
 import numpy as np
-import torch
-from sklearn.metrics import accuracy_score, f1_score
-from torch.nn import CrossEntropyLoss
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data.sampler import RandomSampler, SequentialSampler
+from typing import Dict, List, Optional, Tuple
+from importlib import import_module
+from itertools import chain
 
-from models import (
-    InputExample, 
-    InputFeatures, 
-    Split, 
-    TokenClassificationTask, 
-    TokenClassificationDataset,
-    BaseTransformer, 
-    add_generic_args, 
-    generic_train,
-    tasks
+# model
+import torch.nn as nn
+import transformers
+import nni
+from sklearn.metrics import accuracy_score, f1_score
+from transformers import EvalPrediction
+from transformers import (
+    AutoConfig,
+    AutoModelForTokenClassification,
+    AutoTokenizer,
+    HfArgumentParser,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+    # 옮겨질수잇음
+    TrainerState,
+    TrainerControl,
 )
+from transformers.trainer_utils import is_main_process
+from transformers import TrainerCallback
+
+from finetune import (
+    DataTrainingArguments, 
+    ModelArguments,
+    TokenClassificationDataset,
+    TokenClassificationTask,
+    DataCollatorForTokenClassification, 
+    Split
+)
+from utils import compute_metrics
 
 logger = logging.getLogger(__name__)
 
+# 잘되면 finetune으로
+class NNiCallback(TrainerCallback):
+    def __init__(self, hp_metric = None, greater_is_better=False):
+        self.metrics = []
+        self.hp_metric = hp_metric
+        self.greater_is_better = greater_is_better
+    
+    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, logs=None,**kwargs):
+        metric = logs.get(self.hp_metric)
+        self.metrics.append(metric if metric else 0) # if metric is None append 0
+        nni.report_intermediate_result(metric)
+                    
+    def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if self.greater_is_better:
+            nni.report_final_result(max(self.metrics))
+        else:
+            nni.report_final_result(min(self.metrics))
+        
 
-class NERTransformer(BaseTransformer):
-    """
-    A training module for NER. See BaseTransformer for the core options.
-    """
+        
+        
+#         with open('test-result.json', 'w', encoding='utf-8') as f:
+#             json.dump(state.log_history, f, ensure_ascii=False)
 
-    mode = "token-classification"
-
-    def __init__(self, hparams):
-        if type(hparams) == dict:
-            hparams = Namespace(**hparams)
+class MAIN:
+    """Generalized version of main function for Notebook and Python."""
+    def __init__(self):
+        # argments
         try:
-            token_classification_task_clazz = getattr(tasks, hparams.task_type)
-            self.token_classification_task: TokenClassificationTask = token_classification_task_clazz()
-        except AttributeError:
-            raise ValueError(
-                f"Task {hparams.task_type} needs to be defined as a TokenClassificationTask subclass in {tasks}. "
-                f"Available tasks classes are: {TokenClassificationTask.__subclasses__()}"
-            )
-        self.labels = self.token_classification_task.get_labels(hparams.labels)
-        self.pad_token_label_id = CrossEntropyLoss().ignore_index
-        super().__init__(hparams, len(self.labels), self.mode)
-
-    def forward(self, **inputs):
-        return self.model(**inputs)
-
-    def training_step(self, batch, batch_num):
-        "Compute loss and log."
-        inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
-        if self.config.model_type != "distilbert":
-            inputs["token_type_ids"] = (
-                batch[2] if self.config.model_type in ["bert", "xlnet"] else None
-            )  # XLM and RoBERTa don"t use token_type_ids
-
-        outputs = self(**inputs)
-        loss = outputs[0]
-        # tensorboard_logs = {"loss": loss, "rate": self.lr_scheduler.get_last_lr()[-1]}
-        return {"loss": loss}
-
-    def prepare_data(self):
-        "Called to initialize data. Use the call to construct features"
-        args = self.hparams
-        for mode in Split:
-            dummy_dataset_for_cache = TokenClassificationDataset(
-                token_classification_task = self.token_classification_task
-                data_dir = args.data_dir
-                tokenizer = self.tokenizer,
-                labels = self.labels,
-                model_type = self.config.model_type,
-                max_seq_length = args.max_seq_length,
-                overwrite_cache = args.overwrite_cache,
-                mode = mode
-            )
-
-    def _get_train_sampler(self, dataset: Dataset)-> Optional[torch.utils.data.sampler.Sampler]:
-        if isinstance(dataset, torch.utils.data.IterableDataset) or not isinstance(
-            dataset, collections.abc.Sized
-        ):
-            return None
+            __IPYTHON__
+        except NameError:
+            self.model_args, self.data_args, self.training_args = self._argparse_script()
         else:
-            return (
-                RandomSampler(self.train_dataset)
-                if self.args.local_rank == -1
-                else DistributedSampler(self.train_dataset)
-            )
+            self.model_args, self.data_args, self.training_args = self._argparse_notebook()
+                
+        # logging and seed
+        self._init_logging_and_seed()
         
-    def _get_eval_sampler(self, dataset: Dataset) -> Optional[torch.utils.data.sampler.Sampler]:
-        if self.args.local_rank != -1:
-            return SequentialDistributedSampler(dataset)
-        else:
-            return SequentialSampler(dataset)
-
+    def _argparse_notebook(self):
+        """argparse in notebook is just used for test the code.(Hard-coded)"""
+        
+        model_args = ModelArguments(
+            model_name_or_path = 'hfl/chinese-electra-180g-small-discriminator',
+            task_type = 'SentimentTagging',
+        )
+        
+        data_args = DataTrainingArguments(
+            data_dir = 'data/step-00/basic', 
+            max_seq_length=128,
             
-    def get_dataloader(self, mode: str, batch_size: int, shuffle: bool = False) -> DataLoader:
-        "Load datasets. Called after prepare data."
-        if mode == 'train':
-            mode = Split.train    
-        elif mode == 'dev':
-            mode = Split.dev
-        elif mode == 'test':
-            mode = Split.test
-            
-        dataset = TokenClassificationDataset(
-                token_classification_task = self.token_classification_task
-                data_dir = args.data_dir
-                tokenizer = self.tokenizer,
-                labels = self.labels,
-                model_type = self.config.model_type,
-                max_seq_length = args.max_seq_length,
-                overwrite_cache = args.overwrite_cache,
-                mode = mode
-            )
+        )
         
-        if mode.value == 'train':
-            sampler = self._get_train_sampler()
-            return DataLoader(
-                dataset,
-                batch_size = ,
-                sampler = sampler,
-                collate_fn = ??
-                num_workers = ??
-            )
+        training_args = TrainingArguments(
+            output_dir='ckpt/test',
+            overwrite_output_dir=True, 
+            do_train=True,
+            do_eval=True,
+            evaluate_during_training=True,
+            logging_first_step=True,
+            num_train_epochs=3,
+            per_device_train_batch_size=32,
+            per_device_eval_batch_size=32,
+            gradient_accumulation_steps=1,
+            metric_for_best_model='token-f1',
+            greater_is_better = True
+        )
+        
+        return model_args, data_args, training_args
+    
+    def _argparse_script(self):
+        parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+        if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+            # If we pass only one argument to the script and it's the path to a json file,
+            # let's parse it to get our arguments.
+            model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
         else:
-            sampler = self._get_eval_sampler()
-            return DataLoader(
-                dataset,
-                batch_size = ,
-                sampler = sampler,
-                collate_fn = ??
-                num_workers = ??
-            )
-
-        cached_features_file = self._feature_file(mode)
-        logger.info("Loading features from cached file %s", cached_features_file)
-        
-        
-        features = torch.load(cached_features_file)
-        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-        all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
-        if features[0].token_type_ids is not None:
-            all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
-        else:
-            all_token_type_ids = torch.tensor([0 for f in features], dtype=torch.long)
-            # HACK(we will not use this anymore soon)
-        all_label_ids = torch.tensor([f.label_ids for f in features], dtype=torch.long)
-        return DataLoader(
-            TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_label_ids), batch_size=batch_size
+            model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        return model_args, data_args, training_args
+    
+    def _init_logging_and_seed(self):
+        # Setup logging
+        logging.basicConfig(
+            format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+            datefmt="%m/%d/%Y %H:%M:%S",
+            level=logging.INFO if is_main_process(self.training_args.local_rank) else logging.WARN,
         )
 
-    def validation_step(self, batch, batch_nb):
-        """Compute validation""" ""
-        inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
-        if self.config.model_type != "distilbert":
-            inputs["token_type_ids"] = (
-                batch[2] if self.config.model_type in ["bert", "xlnet"] else None
-            )  # XLM and RoBERTa don"t use token_type_ids
-        outputs = self(**inputs)
-        tmp_eval_loss, logits = outputs[:2]
-        preds = logits.detach().cpu().numpy()
-        out_label_ids = inputs["labels"].detach().cpu().numpy()
-        return {"val_loss": tmp_eval_loss.detach().cpu(), "pred": preds, "target": out_label_ids}
+        # Log on each process the small summary:
+        logger.warning(
+            f"Process rank: {self.training_args.local_rank}, device: {self.training_args.device}, n_gpu: {self.training_args.n_gpu}"
+            + f"distributed training: {bool(self.training_args.local_rank != -1)}, 16-bits training: {self.training_args.fp16}"
+        )
+        # Set the verbosity to info of the Transformers logger (on main process only):
+        if is_main_process(self.training_args.local_rank):
+            transformers.utils.logging.set_verbosity_info()
+        logger.info("Training/evaluation parameters %s", self.training_args)
 
-    def _eval_end(self, outputs):
-        "Evaluation called for both Val and Test"
-        val_loss_mean = torch.stack([x["val_loss"] for x in outputs]).mean()
-        preds = np.concatenate([x["pred"] for x in outputs], axis=0)
-        preds = np.argmax(preds, axis=2)
-        out_label_ids = np.concatenate([x["target"] for x in outputs], axis=0)
+        # Set seed before initializing model.
+        set_seed(self.training_args.seed)
+        
 
-        label_map = {i: label for i, label in enumerate(self.labels)}
-        out_label_list = [[] for _ in range(out_label_ids.shape[0])]
-        preds_list = [[] for _ in range(out_label_ids.shape[0])]
+    def align_predictions(self, predictions: np.ndarray, label_ids: np.ndarray) -> Tuple[List[int], List[int]]:
+        preds = np.argmax(predictions, axis=2)
 
-        for i in range(out_label_ids.shape[0]):
-            for j in range(out_label_ids.shape[1]):
-                if out_label_ids[i, j] != self.pad_token_label_id:
-                    out_label_list[i].append(label_map[out_label_ids[i][j]])
-                    preds_list[i].append(label_map[preds[i][j]])
+        batch_size, seq_len = preds.shape
 
-        results = {
-            "val_loss": val_loss_mean,
-            "accuracy_score": accuracy_score(out_label_list, preds_list),
-            "precision": precision_score(out_label_list, preds_list),
-            "recall": recall_score(out_label_list, preds_list),
-            "f1": f1_score(out_label_list, preds_list),
+        out_label_list = [[] for _ in range(batch_size)]
+        preds_list = [[] for _ in range(batch_size)]
+
+        for i in range(batch_size):
+            for j in range(seq_len):
+                if label_ids[i, j] != nn.CrossEntropyLoss().ignore_index:
+                    out_label_list[i].append(self.label_map[label_ids[i][j]])
+                    preds_list[i].append(self.label_map[preds[i][j]])
+
+        return preds_list, out_label_list
+
+    def compute_metrics(self, p: EvalPrediction) -> Dict:
+        preds_list, out_label_list =  self.align_predictions(p.predictions, p.label_ids)
+
+        ## token-level comparison
+        y_true = list(chain(*out_label_list))
+        y_pred = list(chain(*preds_list))
+
+        y_true = [tok.split('-')[0] for tok in y_true]
+        y_pred = [tok.split('-')[0] for tok in y_pred]
+        ##
+
+        return {
+            "token-f1": f1_score(y_true, y_pred, average='macro'),
+            "token-acc": accuracy_score(y_true, y_pred)
         }
 
-        ret = {k: v for k, v in results.items()}
-        ret["log"] = results
-        return ret, preds_list, out_label_list
-
-    def validation_epoch_end(self, outputs):
-        # when stable
-        ret, preds, targets = self._eval_end(outputs)
-        logs = ret["log"]
-        return {"val_loss": logs["val_loss"], "log": logs, "progress_bar": logs}
-
-    def test_epoch_end(self, outputs):
-        # updating to test_epoch_end instead of deprecated test_end
-        ret, predictions, targets = self._eval_end(outputs)
-
-        # Converting to the dict required by pl
-        # https://github.com/PyTorchLightning/pytorch-lightning/blob/master/\
-        # pytorch_lightning/trainer/logging.py#L139
-        logs = ret["log"]
-        # `val_loss` is the key returned by `self._eval_end()` but actually refers to `test_loss`
-        return {"avg_test_loss": logs["val_loss"], "log": logs, "progress_bar": logs}
-
-    @staticmethod
-    def add_model_specific_args(parser, root_dir):
-        # Add NER specific options
-        BaseTransformer.add_model_specific_args(parser, root_dir)
-        parser.add_argument(
-            "--task_type", default="SentimentTagging", type=str, help="Task type to fine tune in training (e.g. NER, POS, etc)"
+    def main(self, hp_params):
+        model_args = self.model_args
+        data_args = self.data_args
+        training_args = self.training_args
+        
+        # arguments manipulation
+        training_args.output_dir = f"{training_args.output_dir}/{nni.get_experiment_id()}-{nni.get_trial_id()}"
+        training_args.learning_rate = hp_params['learning_rate']
+        training_args.seed = hp_params['seed']
+        
+        
+        # get token classification task instance
+        module = import_module("tasks")
+        try:
+            token_classification_task_clazz = getattr(module, model_args.task_type)
+            token_classification_task: TokenClassificationTask = token_classification_task_clazz()
+        except AttributeError:
+            raise ValueError(
+                f"Task {model_args.task_type} needs to be defined as a TokenClassificationTask subclass in {module}. "
+                f"Available tasks classes are: {TokenClassificationTask.__subclasses__()}"
+            )
+        
+        # label
+        labels = token_classification_task.get_labels(data_args.labels)
+        label_map: Dict[int, str] = {i: label for i, label in enumerate(labels)}
+        num_labels = len(labels)
+        self.label_map = label_map
+        
+        # load pretrained model and tokenizer
+        config = AutoConfig.from_pretrained(
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        num_labels=num_labels,
+        id2label=label_map,
+        label2id={label: i for i, label in enumerate(labels)},
+        cache_dir=model_args.cache_dir,
         )
-        parser.add_argument(
-            "--max_seq_length",
-            default=128,
-            type=int,
-            help="The maximum total input sequence length after tokenization. Sequences longer "
-            "than this will be truncated, sequences shorter will be padded.",
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast,
         )
-
-        parser.add_argument(
-            "--labels",
-            default="",
-            type=str,
-            help="Path to a file containing all labels. If not specified, CoNLL-2003 labels are used.",
+        model = AutoModelForTokenClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
         )
-        parser.add_argument(
-            "--gpus",
-            default=0,
-            type=int,
-            help="The number of GPUs allocated for this, it is by default 0 meaning none",
+        # get dataset and data_collator
+        train_dataset = (
+            TokenClassificationDataset(
+                token_classification_task=token_classification_task,
+                data_dir=data_args.data_dir,
+                tokenizer=tokenizer,
+                labels=labels,
+                model_type=config.model_type,
+                max_seq_length=data_args.max_seq_length,
+                overwrite_cache=data_args.overwrite_cache,
+                mode=Split.train,
+            )
+            if training_args.do_train
+            else None
         )
-
-        parser.add_argument(
-            "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
+        eval_dataset = (
+            TokenClassificationDataset(
+                token_classification_task=token_classification_task,
+                data_dir=data_args.data_dir,
+                tokenizer=tokenizer,
+                labels=labels,
+                model_type=config.model_type,
+                max_seq_length=data_args.max_seq_length,
+                overwrite_cache=data_args.overwrite_cache,
+                mode=Split.dev,
+            )
+            if training_args.do_eval
+            else None
         )
+        data_collator = DataCollatorForTokenClassification(tokenizer)
+        
+        # callbacks
+        callbacks = [
+            NNiCallback(hp_metric=training_args.metric_for_best_model, greater_is_better=training_args.greater_is_better)
+        ]
+        
+        # reset logging, eval and save step as EPOCHS explicitly
+        steps_per_epoch = int(np.ceil(len(train_dataset) / (training_args.train_batch_size * training_args.gradient_accumulation_steps))) 
+        training_args.logging_steps = steps_per_epoch
+        training_args.save_steps  = steps_per_epoch
+        training_args.eval_steps = steps_per_epoch
 
-        return parser
+        
+        # Initialize our Trainer
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            callbacks=callbacks,
+            compute_metrics=self.compute_metrics,
+        )
+        
+        # Training
+        if training_args.do_train:
+            trainer.train(
+                model_path=model_args.model_name_or_path if os.path.isdir(model_args.model_name_or_path) else None
+            )
+            trainer.save_model()
+            # For convenience, we also re-save the tokenizer to the same directory,
+            # so that you can share your model easily on huggingface.co/models =)
+            if trainer.is_world_master():
+                tokenizer.save_pretrained(training_args.output_dir)
+
+        # Evaluation
+        results = {}
+        if training_args.do_eval:
+            logger.info("*** Evaluate ***")
+
+            result = trainer.evaluate()
+
+            output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
+            if trainer.is_world_master():
+                with open(output_eval_file, "w") as writer:
+                    logger.info("***** Eval results *****")
+                    for key, value in result.items():
+                        logger.info("  %s = %s", key, value)
+                        writer.write("%s = %s\n" % (key, value))
+
+                results.update(result)
+
+        # Predict
+        if training_args.do_predict:
+            test_dataset = TokenClassificationDataset(
+                token_classification_task=token_classification_task,
+                data_dir=data_args.data_dir,
+                tokenizer=tokenizer,
+                labels=labels,
+                model_type=config.model_type,
+                max_seq_length=data_args.max_seq_length,
+                overwrite_cache=data_args.overwrite_cache,
+                mode=Split.test,
+            )
+
+            predictions, label_ids, metrics = trainer.predict(test_dataset)
+            preds_list, _ = align_predictions(predictions, label_ids)
+
+            output_test_results_file = os.path.join(training_args.output_dir, "test_results.txt")
+            if trainer.is_world_master():
+                with open(output_test_results_file, "w") as writer:
+                    for key, value in metrics.items():
+                        logger.info("  %s = %s", key, value)
+                        writer.write("%s = %s\n" % (key, value))
+
+            # Save predictions
+            output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
+            if trainer.is_world_master():
+                with open(output_test_predictions_file, "w") as writer:
+                    with open(os.path.join(data_args.data_dir, "test.txt"), "r") as f:
+                        token_classification_task.write_predictions_to_file(writer, f, preds_list)
+                        
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    add_generic_args(parser, os.getcwd())
-    parser = NERTransformer.add_model_specific_args(parser, os.getcwd())
-    args = parser.parse_args()
-    model = NERTransformer(args)
-    print(vars(args))
-#     trainer = generic_train(model, args)
-
-    if args.do_predict:
-        # See https://github.com/huggingface/transformers/issues/3159
-        # pl use this default format to create a checkpoint:
-        # https://github.com/PyTorchLightning/pytorch-lightning/blob/master\
-        # /pytorch_lightning/callbacks/model_checkpoint.py#L322
-        checkpoints = list(sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-epoch=*.ckpt"), recursive=True)))
-        model = model.load_from_checkpoint(checkpoints[-1])
-        trainer.test(model)
+                        
+                        
+if __name__=="__main__":
+    try:
+        param_trials = nni.get_next_parameter()
+        logger.debug(param_trials)
+        MAIN().main(param_trials)
+    except Exception as exception:
+        logger.exception(exception)
+        raise
