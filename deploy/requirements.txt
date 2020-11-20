@@ -1,0 +1,13 @@
+cython
+pandas
+numpy
+attrdict
+tqdm
+transformers >=3.5.0
+onnx
+onnxruntime-gpu
+fastparquet
+setproctitle
+beautifulsoup4
+lxml
+emoji

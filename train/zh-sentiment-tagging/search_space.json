@@ -1,4 +1,12 @@
 {
-    "learning_rate":{"_type":"uniform", "_value":[1e-5, 2e-4]},
+    "backbone" : {"_type":"choice", "_value":[
+        "voidful/albert_chinese_xxlarge",
+        "hfl/chinese-roberta-wwm-ext-large",
+        "hfl/chinese-electra-180g-large-discriminator",
+        "hfl/chinese-macbert-large"
+    ]},
+    "max_seq_length":{"_type":"choice", "_value":[256, 320, 384, 448, 512]},
+    "learning_rate":{"_type":"uniform", "_value":[1e-5, 3e-4]},
     "seed":{"_type":"randint", "_value":[1, 1000]}
 }
+

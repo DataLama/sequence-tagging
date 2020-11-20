@@ -15,7 +15,7 @@ class DataTrainingArguments:
         metadata={"help": "Path to a file containing all labels. If not specified, CoNLL-2003 labels are used."},
     )
     max_seq_length: int = field(
-        default=128,
+        default=512,
         metadata={
             "help": "The maximum total input sequence length after tokenization. Sequences longer "
             "than this will be truncated, sequences shorter will be padded."

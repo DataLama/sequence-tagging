@@ -17,6 +17,9 @@ from transformers import (
     AutoConfig,
     AutoModelForTokenClassification,
     AutoTokenizer,
+    BertConfig,
+    BertForTokenClassification,
+    BertTokenizer,
     HfArgumentParser,
     Trainer,
     TrainingArguments,
@@ -24,6 +27,7 @@ from transformers import (
     # 옮겨질수잇음
     TrainerState,
     TrainerControl,
+    DefaultFlowCallback
 )
 from transformers.trainer_utils import is_main_process
 from transformers import TrainerCallback
@@ -41,28 +45,26 @@ from utils import compute_metrics
 logger = logging.getLogger(__name__)
 
 # 잘되면 finetune으로
+METRICS = []
 class NNiCallback(TrainerCallback):
     def __init__(self, hp_metric = None, greater_is_better=False):
-        self.metrics = []
-        self.hp_metric = hp_metric
+        self.hp_metric = f"eval_{hp_metric}"
         self.greater_is_better = greater_is_better
     
-    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, logs=None,**kwargs):
-        metric = logs.get(self.hp_metric)
-        self.metrics.append(metric if metric else 0) # if metric is None append 0
-        nni.report_intermediate_result(metric)
-                    
-    def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        if self.greater_is_better:
-            nni.report_final_result(max(self.metrics))
-        else:
-            nni.report_final_result(min(self.metrics))
-        
+    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        logs = kwargs.get('logs')
+        if self.hp_metric in logs.keys():
+            metric = logs.get(self.hp_metric)
+            METRICS.append(metric)
+            nni.report_intermediate_result(metric)
 
-        
-        
-#         with open('test-result.json', 'w', encoding='utf-8') as f:
-#             json.dump(state.log_history, f, ensure_ascii=False)
+            
+            
+#     def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+#         if self.greater_is_better:
+#             nni.report_final_result(max(self.metrics))
+#         else:
+#             nni.report_final_result(min(self.metrics))
 
 class MAIN:
     """Generalized version of main function for Notebook and Python."""
@@ -87,9 +89,8 @@ class MAIN:
         )
         
         data_args = DataTrainingArguments(
-            data_dir = 'data/step-00/basic', 
-            max_seq_length=128,
-            
+            data_dir = 'data/step-01', 
+            max_seq_length=512,
         )
         
         training_args = TrainingArguments(
@@ -97,12 +98,14 @@ class MAIN:
             overwrite_output_dir=True, 
             do_train=True,
             do_eval=True,
+            do_predict=True,
+            evaluation_strategy = "steps",
             evaluate_during_training=True,
             logging_first_step=True,
-            num_train_epochs=3,
-            per_device_train_batch_size=32,
-            per_device_eval_batch_size=32,
-            gradient_accumulation_steps=1,
+            num_train_epochs=3.0,
+            per_device_train_batch_size=2,
+            per_device_eval_batch_size=2,
+            gradient_accumulation_steps=16,
             metric_for_best_model='token-f1',
             greater_is_better = True
         )
@@ -172,6 +175,76 @@ class MAIN:
             "token-f1": f1_score(y_true, y_pred, average='macro'),
             "token-acc": accuracy_score(y_true, y_pred)
         }
+    
+    def _custom_config(self, model_args, num_labels, id2label, label2id):
+        if "hfl/chinese-roberta" in model_args.model_name_or_path:
+            """You have to use Bertclass - https://github.com/ymcui/Chinese-BERT-wwm/blob/master/README_EN.md"""
+            config = BertConfig.from_pretrained(
+                    model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+                    num_labels=num_labels,
+                    id2label=id2label,
+                    label2id=label2id,
+                    cache_dir=model_args.cache_dir,
+            )            
+        else:
+            """You can load with AutoClass.
+            - voidful/albert_chinese_xxlarge
+            - hfl/chinese-macbert-large
+            - hfl/chinese-electra-180g-large-discriminator
+            """
+            config = AutoConfig.from_pretrained(
+                    model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+                    num_labels=num_labels,
+                    id2label=id2label,
+                    label2id=label2id,
+                    cache_dir=model_args.cache_dir,
+                    )
+        return config
+    
+    def _custom_tokenizer(self, model_args):
+        if ("hfl/chinese-roberta" in model_args.model_name_or_path) or ("voidful/albert_chinese" in model_args.model_name_or_path):
+            """You have to use Bertclass - https://github.com/ymcui/Chinese-BERT-wwm/blob/master/README_EN.md"""
+            tokenizer = BertTokenizer.from_pretrained(
+                model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+                cache_dir=model_args.cache_dir,
+                use_fast=model_args.use_fast,
+            )            
+        else:
+            """You can load with AutoClass.
+            - hfl/chinese-macbert-large
+            - hfl/chinese-electra-180g-large-discriminator
+            """
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+                cache_dir=model_args.cache_dir,
+                use_fast=model_args.use_fast,
+                    )
+            
+        return tokenizer
+    
+    def _custom_model(self, model_args, config):
+        if "hfl/chinese-roberta" in model_args.model_name_or_path:
+            model = BertForTokenClassification.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                config=config,
+                cache_dir=model_args.cache_dir,
+            )
+        else:
+            """You can load with AutoClass.
+            - voidful/albert_chinese_xxlarge
+            - hfl/chinese-macbert-large
+            - hfl/chinese-electra-180g-large-discriminator
+            """
+            model = AutoModelForTokenClassification.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                config=config,
+                cache_dir=model_args.cache_dir,
+            )
+        return model
+    
+
 
     def main(self, hp_params):
         model_args = self.model_args
@@ -179,9 +252,19 @@ class MAIN:
         training_args = self.training_args
         
         # arguments manipulation
-        training_args.output_dir = f"{training_args.output_dir}/{nni.get_experiment_id()}-{nni.get_trial_id()}"
+        if nni.get_experiment_id() != 'STANDALONE':
+            training_args.output_dir = f"{training_args.output_dir}/{nni.get_experiment_id()}-{nni.get_trial_id()}"
+        model_args.model_name_or_path = hp_params['backbone']
         training_args.learning_rate = hp_params['learning_rate']
         training_args.seed = hp_params['seed']
+        if hp_params["max_seq_length"] > 384:
+            training_args.per_device_train_batch_size = 2
+            training_args.per_device_eval_batch_size = 2
+            training_args.gradient_accumulation_steps = 16
+            data_args.max_seq_length = hp_params["max_seq_length"] 
+        else:
+            data_args.max_seq_length = hp_params["max_seq_length"] 
+        
         
         
         # get token classification task instance
@@ -202,24 +285,33 @@ class MAIN:
         self.label_map = label_map
         
         # load pretrained model and tokenizer
-        config = AutoConfig.from_pretrained(
-        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-        num_labels=num_labels,
-        id2label=label_map,
-        label2id={label: i for i, label in enumerate(labels)},
-        cache_dir=model_args.cache_dir,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast,
-        )
-        model = AutoModelForTokenClassification.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-        )
+        config = self._custom_config(model_args=model_args, 
+                                     num_labels=num_labels, 
+                                     id2label=label_map, 
+                                     label2id={label: i for i, label in enumerate(labels)})
+        tokenizer = self._custom_tokenizer(model_args=model_args)
+        model = self._custom_model(model_args=model_args, config=config)
+        
+        
+#         config = AutoConfig.from_pretrained(
+#         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+#         num_labels=num_labels,
+#         id2label=label_map,
+#         label2id={label: i for i, label in enumerate(labels)},
+#         cache_dir=model_args.cache_dir,
+#         )
+#         tokenizer = AutoTokenizer.from_pretrained(
+#             model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+#             cache_dir=model_args.cache_dir,
+#             use_fast=model_args.use_fast,
+#         )
+#         model = AutoModelForTokenClassification.from_pretrained(
+#             model_args.model_name_or_path,
+#             from_tf=bool(".ckpt" in model_args.model_name_or_path),
+#             config=config,
+#             cache_dir=model_args.cache_dir,
+#         )
+        
         # get dataset and data_collator
         train_dataset = (
             TokenClassificationDataset(
@@ -316,7 +408,7 @@ class MAIN:
             )
 
             predictions, label_ids, metrics = trainer.predict(test_dataset)
-            preds_list, _ = align_predictions(predictions, label_ids)
+            preds_list, _ = self.align_predictions(predictions, label_ids)
 
             output_test_results_file = os.path.join(training_args.output_dir, "test_results.txt")
             if trainer.is_world_master():
@@ -329,10 +421,20 @@ class MAIN:
             output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
             if trainer.is_world_master():
                 with open(output_test_predictions_file, "w") as writer:
-                    with open(os.path.join(data_args.data_dir, "test.txt"), "r") as f:
-                        token_classification_task.write_predictions_to_file(writer, f, preds_list)
+                    with open(os.path.join(data_args.data_dir, "test.json"), "r") as f:
+                        docs = json.load(f)
+                    for doc, preds in zip(docs, preds_list):
+                        text = doc['_source']['text']
+                        labels = doc['_source']['label_list']
+                        preds = ' '.join(preds)
+                        print(f"{text}\t{labels}\t{preds}", file=writer)
                         
-
+                        
+        # nni final result
+        if training_args.greater_is_better:
+            nni.report_final_result(max(METRICS))
+        else:
+            nni.report_final_result(min(METRICS))
 
                         
                         
@@ -344,3 +446,5 @@ if __name__=="__main__":
     except Exception as exception:
         logger.exception(exception)
         raise
+        
+        
